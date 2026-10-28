@@ -231,6 +231,11 @@ export default function (pi: ExtensionAPI) {
       "the child's final message arrives later as a new message (or collect several with subagent_wait). " +
       "The child sees only the task, so write a self-contained brief.",
     promptSnippet: "Start a pi subagent in a Rex pane (background; result arrives as a message)",
+    promptGuidelines: [
+      "After starting subagents, keep working on the main thread on anything that does not need their results (independent edits, reading, verification), and call subagent_wait only when the next step needs those results.",
+      "Don't redo a running subagent's task on the main thread, and don't edit files a running non-worktree subagent may be editing.",
+      "With nothing left to do but wait, end the turn or call subagent_wait; each subagent result arrives as a message when it finishes.",
+    ],
     parameters: Type.Object({
       task: Type.String({ description: "Self-contained brief for the child" }),
       agent: Type.Optional(Type.String({ description: "Agent definition name (see subagent_list). Omit for a general-purpose child with the default tools." })),
