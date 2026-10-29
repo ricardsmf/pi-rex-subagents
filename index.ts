@@ -90,6 +90,9 @@ export default function (pi: ExtensionAPI) {
   let ticker: ReturnType<typeof setInterval> | undefined;
   let spawnLock: Promise<unknown> = Promise.resolve();
   let lastPane: string | undefined;
+  // Aborted on session_shutdown: a wait still pending then belongs to a dead runtime, whose pi and
+  // ctx throw on use. The replacement runtime re-watches running children from the session entries.
+  let live = new AbortController();
 
   if (isChild) {
     pi.on("agent_end", async (event, ctx) => {
@@ -124,7 +127,9 @@ export default function (pi: ExtensionAPI) {
 
   function watch(c: Child) {
     const done = (async (): Promise<Outcome> => {
-      const r = await pi.exec("rex", ["wait", c.block]);
+      const signal = live.signal;
+      const r = await pi.exec("rex", ["wait", c.block], { signal }).catch(() => undefined);
+      if (signal.aborted || !r) return { name: c.name, status: c.status, text: "(session replaced before the subagent finished)" };
       const { text, ok } = lastAssistant(c.sessionFile);
       c.status = r.code === 0 && ok ? "done" : "failed";
       c.exitCode = r.code;
@@ -206,6 +211,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_e, ctx) => {
     ui = ctx;
+    live = new AbortController();
     children.clear();
     finished.clear();
     for (const e of ctx.sessionManager.getEntries()) {
@@ -219,6 +225,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    live.abort();
+    ui = undefined;
     if (ticker) clearInterval(ticker);
     ticker = undefined;
   });
