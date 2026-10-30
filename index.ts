@@ -418,6 +418,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_list",
     label: "List subagents",
+    exposure: "deferred",
     description: "List the agent definitions subagent can start, and this session's subagents with their status.",
     parameters: Type.Object({}),
     async execute() {
