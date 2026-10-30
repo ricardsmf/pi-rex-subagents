@@ -37,6 +37,7 @@ interface Child {
   status: Status;
   startedAt: number;
   exitCode?: number;
+  outcome?: Outcome;
 }
 interface Outcome {
   name: string;
@@ -56,7 +57,12 @@ function lastAssistant(sessionFile: string): { text: string; ok: boolean } {
   }
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i]) continue;
-    const e = JSON.parse(lines[i]);
+    let e;
+    try {
+      e = JSON.parse(lines[i]);
+    } catch {
+      return { text: "(subagent session contains invalid JSON)", ok: false };
+    }
     if (e.type !== "message" || e.message?.role !== "assistant") continue;
     const m = e.message;
     const text = (m.content as { type: string; text?: string }[])
@@ -86,6 +92,7 @@ export default function (pi: ExtensionAPI) {
   const children = new Map<string, Child>();
   const finished = new Map<string, Promise<Outcome>>();
   const claimed = new Set<string>();
+  const usedNames = new Set<string>();
   let ui: ExtensionContext | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
   let spawnLock: Promise<unknown> = Promise.resolve();
@@ -108,6 +115,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   const persist = (c: Child) => pi.appendEntry<Child>(ENTRY, { ...c });
+
+  function outcomeFor(c: Child, text: string): Outcome {
+    const body = text.length > MAX_RESULT_CHARS ? `…${text.slice(-MAX_RESULT_CHARS)}` : text;
+    const wt = c.worktree ? `\nWorktree: ${c.worktree.path} (branch ${c.worktree.branch})` : "";
+    return { name: c.name, status: c.status, text: `${body}${wt}` };
+  }
 
   function render() {
     if (!ui?.hasUI) return;
@@ -133,16 +146,15 @@ export default function (pi: ExtensionAPI) {
       const { text, ok } = lastAssistant(c.sessionFile);
       c.status = r.code === 0 && ok ? "done" : "failed";
       c.exitCode = r.code;
+      const outcome = outcomeFor(c, text);
+      c.outcome = outcome;
       persist(c);
       render();
-      const body = text.length > MAX_RESULT_CHARS ? `…${text.slice(-MAX_RESULT_CHARS)}` : text;
-      const wt = c.worktree ? `\nWorktree: ${c.worktree.path} (branch ${c.worktree.branch})` : "";
-      const outcome = { name: c.name, status: c.status, text: `${body}${wt}` };
       if (!claimed.has(c.name)) {
         pi.sendMessage(
           {
             customType: RESULT,
-            content: `Subagent ${c.name} ${c.status} (transcript ${c.sessionFile}).${wt}\n\n${body}`,
+            content: `Subagent ${c.name} ${c.status} (transcript ${c.sessionFile}).\n\n${outcome.text}`,
             display: true,
             details: { name: c.name, status: c.status },
           },
@@ -181,10 +193,12 @@ export default function (pi: ExtensionAPI) {
 
   function uniqueName(base: string) {
     const clean = base.replace(/[^A-Za-z0-9_.-]/g, "-");
-    if (!children.has(clean)) return clean;
+    let name = clean;
     let i = 2;
-    while (children.has(`${clean}-${i}`)) i++;
-    return `${clean}-${i}`;
+    while (usedNames.has(name)) name = `${clean}-${i++}`;
+    // Reserve before awaiting split: sibling spawns must not share a transcript.
+    usedNames.add(name);
+    return name;
   }
 
   async function addWorktree(cwd: string, name: string) {
@@ -209,20 +223,35 @@ export default function (pi: ExtensionAPI) {
     return def;
   }
 
-  pi.on("session_start", async (_e, ctx) => {
-    ui = ctx;
+  function restore(ctx: ExtensionContext) {
+    // Tree navigation keeps the runtime: detach old watchers before rebuilding this branch.
+    live.abort();
     live = new AbortController();
+    ui = ctx;
     children.clear();
     finished.clear();
+    claimed.clear();
+    usedNames.clear();
+    lastPane = undefined;
+    // Names stay reserved across branches because their transcript files are shared.
     for (const e of ctx.sessionManager.getEntries()) {
+      if (e.type === "custom" && e.customType === ENTRY) usedNames.add((e.data as Child).name);
+    }
+    for (const e of ctx.sessionManager.getBranch()) {
       if (e.type === "custom" && e.customType === ENTRY) {
-        const c = e.data as Child;
+        const c = { ...(e.data as Child) };
         children.set(c.name, c);
       }
     }
-    for (const c of children.values()) if (c.status === "running") watch(c);
+    for (const c of children.values()) {
+      if (c.status === "running") watch(c);
+      else finished.set(c.name, Promise.resolve(c.outcome ?? outcomeFor(c, lastAssistant(c.sessionFile).text)));
+    }
     render();
-  });
+  }
+
+  pi.on("session_start", async (_e, ctx) => restore(ctx));
+  pi.on("session_tree", async (_e, ctx) => restore(ctx));
 
   pi.on("session_shutdown", async () => {
     live.abort();
@@ -325,12 +354,12 @@ export default function (pi: ExtensionAPI) {
         if (enter.code !== 0) throw new Error(`rex send failed: ${enter.stderr.trim()}`);
         return { content: [{ type: "text", text: `Sent to ${c.name}.` }], details: {} };
       }
+      const resumed: Child = { ...c, status: "running", startedAt: Date.now(), outcome: undefined, exitCode: undefined };
+      resumed.block = await split(resumed, p.message);
       claimed.delete(c.name);
-      c.status = "running";
-      c.startedAt = Date.now();
-      c.block = await split(c, p.message);
-      persist(c);
-      watch(c);
+      children.set(c.name, resumed);
+      persist(resumed);
+      watch(resumed);
       render();
       return { content: [{ type: "text", text: `Resumed ${c.name} in Rex pane ${c.block}. Its result arrives as a message.` }], details: {} };
     },
@@ -351,12 +380,28 @@ export default function (pi: ExtensionAPI) {
       if (unknown.length) throw new Error(`No subagent: ${unknown.join(", ")}`);
       const pending = names.filter((n) => children.get(n)?.status === "running");
       for (const n of pending) claimed.add(n);
+      const runtime = live;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let stopWaiting: () => void;
       const stop = new Promise<"stopped">((resolve) => {
-        signal?.addEventListener("abort", () => resolve("stopped"), { once: true });
-        if (p.timeoutSeconds) setTimeout(() => resolve("stopped"), p.timeoutSeconds * 1000);
+        stopWaiting = () => resolve("stopped");
+        signal?.addEventListener("abort", stopWaiting, { once: true });
+        runtime.signal.addEventListener("abort", stopWaiting, { once: true });
+        if (signal?.aborted || runtime.signal.aborted) stopWaiting();
+        if (p.timeoutSeconds) timer = setTimeout(stopWaiting, p.timeoutSeconds * 1000);
       });
       const all = Promise.all(names.map((n) => finished.get(n)!));
-      const r = await Promise.race([all, stop]);
+      let r: Outcome[] | "stopped";
+      try {
+        r = await Promise.race([all, stop]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener("abort", stopWaiting!);
+        runtime.signal.removeEventListener("abort", stopWaiting!);
+      }
+      if (runtime.signal.aborted) {
+        return { content: [{ type: "text", text: "Wait cancelled: session or active branch changed." }], details: {} };
+      }
       if (r === "stopped") {
         // Whatever is still running reports by message as usual.
         const still = pending.filter((n) => children.get(n)?.status === "running");
