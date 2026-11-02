@@ -1,4 +1,4 @@
-// Subagents as pi processes in Rex panes. The parent splits a pane beside itself, `rex wait`s on
+// Subagents as pi processes in Rex panes. The parent opens each in a minimized floating pane, `rex wait`s on
 // it in the background, and posts the child's last assistant message back as a new turn. A child
 // runs with PI_SUBAGENT=1: it exits when its turn ends, and may spawn only PI_SUBAGENT_ALLOWED.
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -96,7 +96,6 @@ export default function (pi: ExtensionAPI) {
   let ui: ExtensionContext | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
   let spawnLock: Promise<unknown> = Promise.resolve();
-  let lastPane: string | undefined;
   // Aborted on session_shutdown: a wait still pending then belongs to a dead runtime, whose pi and
   // ctx throw on use. The replacement runtime re-watches running children from the session entries.
   let live = new AbortController();
@@ -166,25 +165,33 @@ export default function (pi: ExtensionAPI) {
     finished.set(c.name, done);
   }
 
-  async function split(c: Child, task: string): Promise<string> {
+  async function rexApi(method: string, args: object) {
+    const r = await pi.exec("rex", ["api", "call", "-s", process.env.REX_SESSION!, method, JSON.stringify(args)]);
+    if (r.code !== 0) throw new Error(`rex ${method} failed: ${r.stderr.trim() || r.stdout.trim()}`);
+    return JSON.parse(r.stdout);
+  }
+
+  // Each child gets its own floating layer in the parent's window, minimized at once so the
+  // parent's layout stays put; the user restores a child's pane to watch it.
+  async function float(c: Child, task: string): Promise<string> {
     const run = async () => {
-      // Stack children below the newest one; the first goes to the right of the parent.
-      const anchors: [string, string][] = lastPane ? [[lastPane, "below"], [process.env.REX_BLOCK!, "right"]] : [[process.env.REX_BLOCK!, "right"]];
-      let err = "";
-      for (const [anchor, dir] of anchors) {
-        const r = await pi.exec("rex", [
-          "split", "--json", "--focus=false", "-b", anchor, `--split=${dir}`,
-          ...(dir === "right" ? ["--ratio", "45"] : []),
-          "--label", c.name, "--cwd", c.cwd,
-          "--", "env", ...c.env, "pi", ...c.piArgs, "--session", c.sessionFile, "--", task,
-        ]);
-        if (r.code === 0) {
-          lastPane = JSON.parse(r.stdout).block_ids[0] as string;
-          return lastPane;
-        }
-        err = r.stderr.trim() || r.stdout.trim();
-      }
-      throw new Error(`rex split failed: ${err}`);
+      const view = await rexApi("session.view", {});
+      const win = view.windows?.find((w: any) => w.layers?.some((l: any) => l.blocks?.some((b: any) => b.block_id === process.env.REX_BLOCK)));
+      const created = await rexApi("session.new_layer", {
+        ...(win ? { window_id: win.window_id } : {}),
+        bounds: [0.1, 0.1, 0.8, 0.8],
+        focus: false,
+        layout: {
+          block: {
+            flavor: "com.superlogical.terminal.shell",
+            label: c.name,
+            options: { cwd: c.cwd, command: ["env", ...c.env, "pi", ...c.piArgs, "--session", c.sessionFile, "--", task] },
+          },
+        },
+      });
+      // A failed minimize leaves a visible child, which still works.
+      await rexApi("session.set_layer_state", { layer_id: created.layer_id, state: "minimized" }).catch(() => undefined);
+      return created.block_ids[0] as string;
     };
     const p = spawnLock.then(run, run);
     spawnLock = p.catch(() => undefined);
@@ -196,7 +203,7 @@ export default function (pi: ExtensionAPI) {
     let name = clean;
     let i = 2;
     while (usedNames.has(name)) name = `${clean}-${i++}`;
-    // Reserve before awaiting split: sibling spawns must not share a transcript.
+    // Reserve before awaiting the pane: sibling spawns must not share a transcript.
     usedNames.add(name);
     return name;
   }
@@ -232,7 +239,6 @@ export default function (pi: ExtensionAPI) {
     finished.clear();
     claimed.clear();
     usedNames.clear();
-    lastPane = undefined;
     // Names stay reserved across branches because their transcript files are shared.
     for (const e of ctx.sessionManager.getEntries()) {
       if (e.type === "custom" && e.customType === ENTRY) usedNames.add((e.data as Child).name);
@@ -264,7 +270,7 @@ export default function (pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description:
-      "Start a subagent: a separate pi in a Rex pane beside this one, with its own context. Returns at once; " +
+      "Start a subagent: a separate pi in a minimized floating Rex pane, with its own context. Returns at once; " +
       "the child's final message arrives later as a new message (or collect several with subagent_wait). " +
       "The child sees only the task, so write a self-contained brief.",
     promptSnippet: "Start a pi subagent in a Rex pane (background; result arrives as a message)",
@@ -285,7 +291,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, p, _signal, _onUpdate, ctx) {
       ui = ctx;
-      if (!process.env.REX_BLOCK) throw new Error("subagent needs pi running in a Rex pane (REX_BLOCK is unset).");
+      if (!process.env.REX_BLOCK || !process.env.REX_SESSION) throw new Error("subagent needs pi running in a Rex pane (REX_BLOCK or REX_SESSION is unset).");
       const def = lookup(p.agent);
       const name = uniqueName(p.name ?? def?.name ?? "agent");
       let cwd = p.cwd ?? ctx.cwd;
@@ -320,7 +326,7 @@ export default function (pi: ExtensionAPI) {
       const env = ["PI_SUBAGENT=1", `PI_SUBAGENT_NAME=${name}`, ...(def?.spawns?.length ? [`PI_SUBAGENT_ALLOWED=${def.spawns.join(",")}`] : [])];
 
       const c: Child = { name, agent: def?.name, block: "", sessionFile, cwd, worktree, piArgs, env, status: "running", startedAt: Date.now() };
-      c.block = await split(c, p.task);
+      c.block = await float(c, p.task);
       children.set(name, c);
       persist(c);
       watch(c);
@@ -355,7 +361,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Sent to ${c.name}.` }], details: {} };
       }
       const resumed: Child = { ...c, status: "running", startedAt: Date.now(), outcome: undefined, exitCode: undefined };
-      resumed.block = await split(resumed, p.message);
+      resumed.block = await float(resumed, p.message);
       claimed.delete(c.name);
       children.set(c.name, resumed);
       persist(resumed);

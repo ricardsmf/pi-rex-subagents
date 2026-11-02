@@ -27,6 +27,7 @@ const fixture = JSON.parse(readFileSync(new URL("./recorded.json", import.meta.u
 const agentDir = mkdtempSync(join(tmpdir(), "rex-recovery-agent-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 process.env.REX_BLOCK = fixture.child.block;
+process.env.REX_SESSION = "session:test";
 delete process.env.PI_SUBAGENT;
 const { default: extension } = await jiti.import(source);
 after(() => rmSync(agentDir, { recursive: true, force: true }));
@@ -67,9 +68,14 @@ function harness(branchChildren: any[], otherChildren: any[] = []) {
         opts.signal.addEventListener("abort", () => finish(1), { once: true });
         waits.push({ signal: opts.signal, finish });
       });
-      if (args[0] === "split") {
-        if (splitError) return { code: 1, stderr: "recorded pane unavailable" };
-        return { code: 0, stdout: JSON.stringify({ block_ids: [fixture.child.block] }) };
+      if (args[0] === "api") {
+        const method = args[4];
+        if (method === "session.view") return { code: 0, stdout: JSON.stringify({ windows: [] }) };
+        if (method === "session.set_layer_state") return { code: 0, stdout: "{}" };
+        if (method === "session.new_layer") {
+          if (splitError) return { code: 1, stderr: "recorded pane unavailable" };
+          return { code: 0, stdout: JSON.stringify({ layer_id: "layer:test", block_ids: [fixture.child.block] }) };
+        }
       }
       throw new Error(`Unexpected exec: ${args.join(" ")}`);
     },
@@ -204,7 +210,7 @@ test("failed resume keeps the completed child and its outcome", async () => {
   const h = harness([{ status: "done", outcome: { name: fixture.child.name, status: "done", text: answer } }]);
   await h.emit("session_start");
   h.failSplits();
-  await assert.rejects(h.call("subagent_message", { name: h.child.name, message: "Continue" }), /rex split failed/);
+  await assert.rejects(h.call("subagent_message", { name: h.child.name, message: "Continue" }), /rex session.new_layer failed/);
   assert.match(await h.list(), /: done/);
   assert.ok((await h.wait({ names: [h.child.name] })).content[0].text.includes(answer));
 });
