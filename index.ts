@@ -277,7 +277,6 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "After starting subagents, keep working on the main thread on anything that does not need their results (independent edits, reading, verification), and call subagent_wait only when the next step needs those results.",
       "Don't redo a running subagent's task on the main thread, and don't edit files a running non-worktree subagent may be editing.",
-      "With nothing left to do but wait, end the turn or call subagent_wait; each subagent result arrives as a message when it finishes.",
     ],
     parameters: Type.Object({
       task: Type.String({ description: "Self-contained brief for the child" }),
@@ -342,6 +341,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_message",
     label: "Message subagent",
+    exposure: "deferred",
     description:
       "Send a message to a subagent by name. A running child reads it at its next turn boundary; a finished child is resumed with the message as its next task, in a new pane.",
     parameters: Type.Object({
