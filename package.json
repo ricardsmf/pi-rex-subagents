@@ -1,0 +1,19 @@
+{
+  "name": "pi-rex-subagents",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi subagents as pi processes in minimized floating Rex panes",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
