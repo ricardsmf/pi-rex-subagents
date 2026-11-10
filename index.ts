@@ -21,12 +21,12 @@ const ROOT = join(getAgentDir(), "subagents");
 const MAX_RESULT_CHARS = 40_000;
 const READONLY_TOOLS = ["read", "grep", "find", "bash"];
 const SPAWN_TOOLS = ["subagent", "subagent_message", "subagent_wait", "subagent_list"];
-// Model families the pstack sheet and agent files use; pi-claude-code serves them under claude-code/.
+// Model families the pstack sheet and agent files use; pi-claude-cli serves them under pi-claude-cli/.
 const FAMILIES: Record<string, string> = {
-  opus: "claude-code/claude-opus-5-5",
-  fable: "claude-code/claude-fable-5-1",
-  sonnet: "claude-code/claude-sonnet-5-5",
-  haiku: "claude-code/claude-haiku-5-5",
+  opus: "pi-claude-cli/claude-opus-5-5",
+  fable: "pi-claude-cli/claude-fable-5-2",
+  sonnet: "pi-claude-cli/claude-sonnet-5-5",
+  haiku: "pi-claude-cli/claude-haiku-5-5",
 };
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
