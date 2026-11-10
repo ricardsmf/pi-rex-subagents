@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -50,6 +50,7 @@ function harness(branchChildren: any[], otherChildren: any[] = []) {
   const messages: any[] = [];
   const persisted: any[] = [];
   const waits: { signal: AbortSignal; finish: (code?: number) => void }[] = [];
+  const commands: string[][] = [];
   let splitError = false;
   const pi = {
     on: (name: string, handler: Function) => handlers.set(name, handler),
@@ -60,7 +61,7 @@ function harness(branchChildren: any[], otherChildren: any[] = []) {
       all.push(entry);
       persisted.push(entry);
     },
-    sendMessage: (message: any) => messages.push(message),
+    sendMessage: (message: any, options: any) => messages.push({ ...message, options }),
     getThinkingLevel: () => "medium",
     exec: async (_command: string, args: string[], opts: any) => {
       if (args[0] === "wait") return new Promise((resolveWait) => {
@@ -74,6 +75,7 @@ function harness(branchChildren: any[], otherChildren: any[] = []) {
         if (method === "session.set_layer_state") return { code: 0, stdout: "{}" };
         if (method === "session.new_layer") {
           if (splitError) return { code: 1, stderr: "recorded pane unavailable" };
+          commands.push(JSON.parse(args[5]).layout.block.options.command);
           return { code: 0, stdout: JSON.stringify({ layer_id: "layer:test", block_ids: [fixture.child.block] }) };
         }
       }
@@ -84,15 +86,24 @@ function harness(branchChildren: any[], otherChildren: any[] = []) {
   const ctx = {
     hasUI: false,
     cwd: dir,
-    sessionManager: { getBranch: () => branch, getEntries: () => all, getSessionId: () => fixture.sessionId },
+    hasPendingMessages: () => false,
+    sessionManager: {
+      getBranch: () => branch,
+      getEntries: () => all,
+      getSessionId: () => fixture.sessionId,
+      getSessionFile: () => join(dir, "parent.jsonl"),
+    },
   };
-  const emit = async (name: string) => handlers.get(name)?.({}, ctx);
+  const emit = async (name: string, event = {}) => handlers.get(name)?.(event, ctx);
   cleanups.push(() => emit("session_shutdown"));
   const call = (name: string, params = {}, signal?: AbortSignal) => tools.get(name).execute("", params, signal, undefined, ctx);
   const wait = (params = {}, signal?: AbortSignal) => call("subagent_wait", params, signal);
   const list = async () => (await call("subagent_list")).content[0].text;
   return {
-    child, sessionFile, messages, persisted, waits, ctx, emit, call, wait, list,
+    child, sessionFile, messages, persisted, waits, commands, ctx, emit, call, wait, list,
+    children: () => persisted.filter((entry) => entry.customType === "rex-subagent"),
+    // What pi emits once a result message is in the transcript.
+    land: (message: any) => emit("message_end", { message: { role: "custom", customType: message.customType, details: message.details } }),
     navigate: async (items: any[]) => { branch = entries(items); await emit("session_tree"); },
     failSplits: () => { splitError = true; },
     branch: () => branch,
@@ -144,8 +155,8 @@ test("running children survive runtime replacement and persist a reusable outcom
   h.waits[1].finish();
   const result = await waiting;
   assert.ok(result.content[0].text.includes(answer));
-  assert.equal(h.persisted.length, 1);
-  assert.equal(h.persisted[0].data.outcome.text, answer);
+  assert.equal(h.children().length, 1);
+  assert.equal(h.children()[0].data.outcome.text, answer);
   assert.equal(h.messages.length, 0);
   await h.emit("session_start");
   assert.ok((await h.wait({ names: [h.child.name] })).content[0].text.includes(answer));
@@ -232,4 +243,98 @@ test("concurrent sibling spawns reserve different transcript names", async () =>
   ]);
   assert.deepEqual(results.map((result) => result.details.name), [h.child.name, `${h.child.name}-2`]);
   assert.notEqual(h.persisted[0].data.sessionFile, h.persisted[1].data.sessionFile);
+});
+
+const tick = () => new Promise(setImmediate);
+
+test("a result dropped from pi's queue is put back when the agent settles", async () => {
+  const h = harness([{}]);
+  await h.emit("session_start");
+  h.waits[0].finish();
+  await tick();
+  assert.equal(h.messages.length, 1);
+  assert.equal(h.messages[0].options.triggerTurn, true);
+  // Escape emptied the queue before the message landed: it returns without restarting the agent.
+  await h.emit("agent_settled", { aborted: true });
+  assert.equal(h.messages.length, 2);
+  assert.equal(h.messages[1].content, h.messages[0].content);
+  assert.equal(h.messages[1].options.triggerTurn, false);
+  // pi emits no message_end to extensions for a message appended without a turn.
+  await h.emit("agent_settled", { aborted: true });
+  assert.equal(h.messages.length, 2);
+});
+
+test("a result that landed in the transcript is not sent again when the agent settles", async () => {
+  const h = harness([{}]);
+  await h.emit("session_start");
+  h.waits[0].finish();
+  await tick();
+  await h.land(h.messages[0]);
+  await h.emit("agent_settled", { aborted: false });
+  assert.equal(h.messages.length, 1);
+});
+
+test("a result still queued when pi quit is added on restore, once", async () => {
+  const outcome = { name: fixture.child.name, status: "done", text: answer };
+  const h = harness([{ status: "done", delivered: false, outcome }]);
+  await h.emit("session_start");
+  assert.equal(h.messages.length, 1);
+  assert.ok(h.messages[0].content.includes(answer));
+  assert.equal(h.messages[0].options.triggerTurn, false);
+  await h.emit("session_start");
+  assert.equal(h.messages.length, 1);
+});
+
+test("a result collected by subagent_wait is not sent again", async () => {
+  const h = harness([{}]);
+  await h.emit("session_start");
+  const waiting = h.wait({ names: [h.child.name] });
+  h.waits[0].finish();
+  await waiting;
+  await h.emit("agent_settled", { aborted: false });
+  await h.emit("session_start");
+  assert.equal(h.messages.length, 0);
+});
+
+test("a message reaches a running child over its socket with its newlines", async () => {
+  const h = harness([]);
+  await h.emit("session_start");
+  const { details } = await h.call("subagent", { name: h.child.name, task: "Inspect configuration" });
+  const socket = h.commands[0].find((arg) => arg.startsWith("PI_SUBAGENT_SOCKET="))!.split("=")[1];
+  const handlers = new Map<string, Function>();
+  const received: unknown[][] = [];
+  process.env.PI_SUBAGENT = "1";
+  process.env.PI_SUBAGENT_SOCKET = socket;
+  try {
+    const { default: child } = await jiti.import(source);
+    child({
+      on: (name: string, handler: Function) => handlers.set(name, handler),
+      sendUserMessage: (...args: unknown[]) => received.push(args),
+    });
+  } finally {
+    delete process.env.PI_SUBAGENT;
+    delete process.env.PI_SUBAGENT_SOCKET;
+  }
+  cleanups.push(() => handlers.get("session_shutdown")!({}, {}));
+  await handlers.get("session_start")!({}, {});
+  await h.call("subagent_message", { name: details.name, message: "First line\nSecond line" });
+  assert.deepEqual(received, [["First line\nSecond line", { deliverAs: "steer" }]]);
+  await handlers.get("session_shutdown")!({}, {});
+  assert.equal(existsSync(socket), false);
+});
+
+test("fork starts the child from the parent's branch without this extension's entries", async () => {
+  const h = harness([{ status: "done" }]);
+  const [first, second, third] = fixture.branch;
+  const [childId, deliveredId] = fixture.extensionEntryIds;
+  const child = { ...h.branch()[0], id: childId, parentId: second.id };
+  const delivered = { type: "custom", customType: "rex-subagent-delivered", id: deliveredId, parentId: childId, data: { name: h.child.name, startedAt: h.child.startedAt } };
+  h.branch().splice(0, 1, first, second, child, delivered, { ...third, parentId: deliveredId });
+  await h.emit("session_start");
+  await h.call("subagent", { name: "forked", task: "Inspect configuration", fork: true });
+  const [header, ...entries] = readFileSync(h.children()[0].data.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(header.type, "session");
+  assert.equal(header.cwd, h.ctx.cwd);
+  assert.equal(header.parentSession, h.ctx.sessionManager.getSessionFile());
+  assert.deepEqual(entries, fixture.branch);
 });

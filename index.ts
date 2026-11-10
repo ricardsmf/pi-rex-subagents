@@ -1,15 +1,21 @@
 // Subagents as pi processes in Rex panes. The parent opens each in a minimized floating pane, `rex wait`s on
 // it in the background, and posts the child's last assistant message back as a new turn. A child
-// runs with PI_SUBAGENT=1: it exits when its turn ends, and may spawn only PI_SUBAGENT_ALLOWED.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+// runs with PI_SUBAGENT=1: it exits when its turn ends, takes the parent's messages on PI_SUBAGENT_SOCKET,
+// and may spawn only PI_SUBAGENT_ALLOWED.
+import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection, createServer, type Server } from "node:net";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { createInterface } from "node:readline";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type AgentDef, loadAgents } from "./agents.ts";
 
 const ENTRY = "rex-subagent";
 const RESULT = "rex-subagent-result";
+const DELIVERED = "rex-subagent-delivered";
 const WIDGET = "rex-subagents";
 const ROOT = join(getAgentDir(), "subagents");
 const MAX_RESULT_CHARS = 40_000;
@@ -38,6 +44,8 @@ interface Child {
   startedAt: number;
   exitCode?: number;
   outcome?: Outcome;
+  // false from the moment a run finishes until its result is in the parent's transcript
+  delivered?: boolean;
 }
 interface Outcome {
   name: string;
@@ -83,6 +91,70 @@ function resolveModel(model: string | undefined, ctx: ExtensionContext): string 
   return FAMILIES[model] ?? model;
 }
 
+// Unix socket paths are capped near 100 bytes, so a child's socket is named by a hash of its transcript path.
+const socketPath = (sessionFile: string) =>
+  join(tmpdir(), `pi-subagent-${createHash("sha256").update(sessionFile).digest("hex").slice(0, 16)}.sock`);
+
+// One request per connection: {"message"} in, {"ok"} or {"error"} back.
+function listen(path: string, onMessage: (message: string) => void): Server {
+  rmSync(path, { force: true });
+  const server = createServer((socket) => {
+    socket.on("error", () => {});
+    createInterface({ input: socket }).once("line", (line) => {
+      let reply: { ok: true } | { error: string };
+      try {
+        const { message } = JSON.parse(line);
+        if (typeof message !== "string" || !message) throw new Error("empty message");
+        onMessage(message);
+        reply = { ok: true };
+      } catch (e) {
+        reply = { error: e instanceof Error ? e.message : String(e) };
+      }
+      socket.end(`${JSON.stringify(reply)}\n`);
+    });
+  });
+  server.on("error", () => {});
+  server.listen(path, () => chmodSync(path, 0o600));
+  return server.unref();
+}
+
+function post(path: string, message: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(path);
+    socket.setTimeout(5000, () => socket.destroy(new Error("the subagent did not answer")));
+    socket.on("error", reject);
+    socket.on("close", () => reject(new Error("the subagent closed the connection")));
+    socket.on("connect", () => socket.write(`${JSON.stringify({ message })}\n`));
+    createInterface({ input: socket }).once("line", (line) => {
+      try {
+        const reply = JSON.parse(line);
+        if (reply.ok) resolve();
+        else reject(new Error(reply.error));
+      } catch (e) {
+        reject(e);
+      }
+      socket.destroy();
+    });
+  });
+}
+
+// A forked child starts from a copy of the parent's active branch. This extension's entries stay behind:
+// a child allowed to spawn would adopt the parent's subagents on restore.
+function writeFork(sessionFile: string, cwd: string, parent: ExtensionContext["sessionManager"]) {
+  const header = SessionManager.create(cwd, dirname(sessionFile), { parentSession: parent.getSessionFile() }).getHeader();
+  const dropped = new Map<string, string | null>();
+  const entries: object[] = [];
+  for (const e of parent.getBranch()) {
+    const mapped = e.parentId === null ? undefined : dropped.get(e.parentId);
+    const parentId = mapped === undefined ? e.parentId : mapped;
+    if (e.type === "custom" && (e.customType === ENTRY || e.customType === DELIVERED)) dropped.set(e.id, parentId);
+    else entries.push({ ...e, parentId });
+  }
+  writeFileSync(sessionFile, [header, ...entries].map((e) => `${JSON.stringify(e)}\n`).join(""));
+}
+
+const runKey = (c: { name: string; startedAt: number }) => `${c.name}@${c.startedAt}`;
+
 const elapsed = (ms: number) => {
   const s = Math.floor(ms / 1000);
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -101,6 +173,16 @@ export default function (pi: ExtensionAPI) {
   let live = new AbortController();
 
   if (isChild) {
+    const socket = process.env.PI_SUBAGENT_SOCKET;
+    let inbox: Server | undefined;
+    pi.on("session_start", async () => {
+      // A steer queues behind the current turn's tool calls; an idle child starts a new turn with it.
+      if (socket) inbox = listen(socket, (message) => pi.sendUserMessage(message, { deliverAs: "steer" }));
+    });
+    pi.on("session_shutdown", async () => {
+      inbox?.close();
+      inbox = undefined;
+    });
     pi.on("agent_end", async (event, ctx) => {
       const last = [...event.messages].reverse().find((m) => m.role === "assistant") as
         | { stopReason?: string }
@@ -119,6 +201,47 @@ export default function (pi: ExtensionAPI) {
     const body = text.length > MAX_RESULT_CHARS ? `…${text.slice(-MAX_RESULT_CHARS)}` : text;
     const wt = c.worktree ? `\nWorktree: ${c.worktree.path} (branch ${c.worktree.branch})` : "";
     return { name: c.name, status: c.status, text: `${body}${wt}` };
+  }
+
+  function announce(c: Child, triggerTurn: boolean) {
+    pi.sendMessage(
+      {
+        customType: RESULT,
+        content: `Subagent ${c.name} ${c.status} (transcript ${c.sessionFile}).\n\n${c.outcome!.text}`,
+        display: true,
+        details: { name: c.name, status: c.status, startedAt: c.startedAt },
+      },
+      { triggerTurn, deliverAs: "followUp" },
+    );
+  }
+
+  // The result reached the parent's transcript, as a message or in a subagent_wait result.
+  function confirm(c: Child | undefined) {
+    if (c?.delivered !== false) return;
+    c.delivered = true;
+    pi.appendEntry(DELIVERED, { name: c.name, startedAt: c.startedAt });
+  }
+
+  // For an idle pi. Without a turn the message is appended at once, and extensions get no message_end for it.
+  function append(c: Child) {
+    announce(c, false);
+    confirm(c);
+  }
+
+  async function steer(c: Child, message: string, signal?: AbortSignal) {
+    // A child takes a few seconds to start listening.
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      try {
+        return await post(socketPath(c.sessionFile), message);
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ECONNREFUSED") throw e;
+        if (c.status !== "running") throw new Error(`Subagent ${c.name} finished before taking the message; send it again to resume it.`);
+        if (signal?.aborted || Date.now() > deadline) throw new Error(`Subagent ${c.name} has not started listening for messages; retry shortly.`);
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
   }
 
   function render() {
@@ -147,19 +270,10 @@ export default function (pi: ExtensionAPI) {
       c.exitCode = r.code;
       const outcome = outcomeFor(c, text);
       c.outcome = outcome;
+      c.delivered = false;
       persist(c);
       render();
-      if (!claimed.has(c.name)) {
-        pi.sendMessage(
-          {
-            customType: RESULT,
-            content: `Subagent ${c.name} ${c.status} (transcript ${c.sessionFile}).\n\n${outcome.text}`,
-            display: true,
-            details: { name: c.name, status: c.status },
-          },
-          { triggerTurn: true, deliverAs: "followUp" },
-        );
-      }
+      if (!claimed.has(c.name)) announce(c, true);
       return outcome;
     })();
     finished.set(c.name, done);
@@ -185,7 +299,7 @@ export default function (pi: ExtensionAPI) {
           block: {
             flavor: "com.superlogical.terminal.shell",
             label: c.name,
-            options: { cwd: c.cwd, command: ["env", ...c.env, "pi", ...c.piArgs, "--session", c.sessionFile, "--", task] },
+            options: { cwd: c.cwd, command: ["env", ...c.env, `PI_SUBAGENT_SOCKET=${socketPath(c.sessionFile)}`, "pi", ...c.piArgs, "--session", c.sessionFile, "--", task] },
           },
         },
       });
@@ -243,21 +357,50 @@ export default function (pi: ExtensionAPI) {
     for (const e of ctx.sessionManager.getEntries()) {
       if (e.type === "custom" && e.customType === ENTRY) usedNames.add((e.data as Child).name);
     }
+    const delivered = new Set<string>();
     for (const e of ctx.sessionManager.getBranch()) {
-      if (e.type === "custom" && e.customType === ENTRY) {
+      if (e.type !== "custom") continue;
+      if (e.customType === ENTRY) {
         const c = { ...(e.data as Child) };
         children.set(c.name, c);
+      } else if (e.customType === DELIVERED) {
+        delivered.add(runKey(e.data as Child));
       }
     }
     for (const c of children.values()) {
-      if (c.status === "running") watch(c);
-      else finished.set(c.name, Promise.resolve(c.outcome ?? outcomeFor(c, lastAssistant(c.sessionFile).text)));
+      if (c.status === "running") {
+        watch(c);
+        continue;
+      }
+      finished.set(c.name, Promise.resolve(c.outcome ?? outcomeFor(c, lastAssistant(c.sessionFile).text)));
+      if (c.delivered !== false) continue;
+      if (delivered.has(runKey(c))) c.delivered = true;
+      // The last runtime ended with this result still queued: add it now, without starting a turn.
+      else append(c);
     }
     render();
   }
 
   pi.on("session_start", async (_e, ctx) => restore(ctx));
   pi.on("session_tree", async (_e, ctx) => restore(ctx));
+
+  pi.on("message_end", async (event) => {
+    const m = event.message as { role: string; customType?: string; details?: { name?: string; startedAt?: number } };
+    if (m.role !== "custom" || m.customType !== RESULT) return;
+    const c = children.get(m.details?.name ?? "");
+    if (c?.startedAt === m.details?.startedAt) confirm(c);
+  });
+
+  // Escape empties pi's queue, taking a queued result with it. Put it back in the transcript, but leave
+  // an agent the user just stopped alone.
+  pi.on("agent_settled", async (event, ctx) => {
+    if (ctx.hasPendingMessages()) return;
+    for (const c of children.values()) {
+      if (c.delivered !== false || claimed.has(c.name)) continue;
+      if (event.aborted) append(c);
+      else announce(c, true);
+    }
+  });
 
   pi.on("session_shutdown", async () => {
     live.abort();
@@ -272,7 +415,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Start a subagent: a separate pi in a minimized floating Rex pane, with its own context. Returns at once; " +
       "the child's final message arrives later as a new message (or collect several with subagent_wait). " +
-      "The child sees only the task, so write a self-contained brief.",
+      "The child sees only the task unless fork is set, so write a self-contained brief.",
     promptSnippet: "Start a pi subagent in a Rex pane (background; result arrives as a message)",
     promptGuidelines: [
       "After starting subagents, keep working on the main thread on anything that does not need their results (independent edits, reading, verification), and call subagent_wait only when the next step needs those results.",
@@ -286,6 +429,7 @@ export default function (pi: ExtensionAPI) {
       thinking: Type.Optional(StringEnum(THINKING, { description: "Reasoning effort. Default: the agent's, else this session's" })),
       readonly: Type.Optional(Type.Boolean({ description: "Limit the child to read, grep, find and bash, and tell it not to edit files" })),
       worktree: Type.Optional(Type.Boolean({ description: "Run the child in a new git worktree on its own branch" })),
+      fork: Type.Optional(Type.Boolean({ description: "Start the child from a copy of this conversation, with the task as its next message" })),
       cwd: Type.Optional(Type.String({ description: "Working directory (default: this session's)" })),
     }),
     async execute(_id, p, _signal, _onUpdate, ctx) {
@@ -305,12 +449,15 @@ export default function (pi: ExtensionAPI) {
         promptFile,
         [
           `You are subagent "${name}", started by another pi session. Your final message is returned to it verbatim, so make it complete and self-contained.`,
+          p.fork ? "Your history is a copy of that session's conversation up to the moment it started you; your task is the message after it." : "",
           p.readonly ? "Read-only task: do not edit, write, move or delete files, and run only commands that change nothing." : "",
           def?.systemPrompt ?? "",
         ]
           .filter(Boolean)
           .join("\n\n"),
       );
+
+      if (p.fork) writeFork(sessionFile, cwd, ctx.sessionManager);
 
       const model = resolveModel(p.model ?? def?.model, ctx);
       const thinking = p.thinking ?? def?.thinking ?? pi.getThinkingLevel();
@@ -348,19 +495,15 @@ export default function (pi: ExtensionAPI) {
       name: Type.String(),
       message: Type.String(),
     }),
-    async execute(_id, p, _signal, _onUpdate, ctx) {
+    async execute(_id, p, signal, _onUpdate, ctx) {
       ui = ctx;
       const c = children.get(p.name);
       if (!c) throw new Error(`No subagent "${p.name}". Known: ${[...children.keys()].join(", ") || "none"}`);
       if (c.status === "running") {
-        // A newline would submit early, so the message goes in as one line.
-        const text = p.message.replace(/\s*\n\s*/g, " ");
-        const sent = await pi.exec("rex", ["send", "-b", c.block, text]);
-        const enter = sent.code === 0 ? await pi.exec("rex", ["send-key", "-b", c.block, "enter"]) : sent;
-        if (enter.code !== 0) throw new Error(`rex send failed: ${enter.stderr.trim()}`);
+        await steer(c, p.message, signal);
         return { content: [{ type: "text", text: `Sent to ${c.name}.` }], details: {} };
       }
-      const resumed: Child = { ...c, status: "running", startedAt: Date.now(), outcome: undefined, exitCode: undefined };
+      const resumed: Child = { ...c, status: "running", startedAt: Date.now(), outcome: undefined, exitCode: undefined, delivered: undefined };
       resumed.block = await float(resumed, p.message);
       claimed.delete(c.name);
       children.set(c.name, resumed);
@@ -414,9 +557,11 @@ export default function (pi: ExtensionAPI) {
         for (const n of still) claimed.delete(n);
         const done = names.filter((n) => !still.includes(n));
         const got = await Promise.all(done.map((n) => finished.get(n)!));
+        for (const n of done) confirm(children.get(n));
         const text = [...got.map((o) => `## ${o.name} (${o.status})\n\n${o.text}`), `Still running: ${still.join(", ")}`].join("\n\n");
         return { content: [{ type: "text", text }], details: {} };
       }
+      for (const n of names) confirm(children.get(n));
       return { content: [{ type: "text", text: r.map((o) => `## ${o.name} (${o.status})\n\n${o.text}`).join("\n\n") }], details: {} };
     },
   });

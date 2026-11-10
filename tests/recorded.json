@@ -1,5 +1,5 @@
 {
-  "source": "Recorded subagent metadata and first paragraph of an assistant reply from the pi setup review; paths and provider signatures omitted.",
+  "source": "Recorded subagent metadata and first paragraph of an assistant reply from the pi setup review; paths and provider signatures omitted. branch is the first three entries of a later session; extensionEntryIds are the ids of two consecutive rex-subagent entries from another.",
   "child": {
     "name": "cloak-hardening",
     "block": "block:01a18d69-69f8-73a1-927d-828a5efaece5",
@@ -16,5 +16,11 @@
       }
     ]
   },
-  "sessionId": "01a18d65-5d99-70d1-a398-e0812161acb9"
+  "sessionId": "01a18d65-5d99-70d1-a398-e0812161acb9",
+  "branch": [
+    { "type": "model_change", "id": "6a84b517", "parentId": null, "timestamp": "2026-11-10T16:54:54.154Z", "provider": "pi-claude-cli", "modelId": "claude-opus-5-5" },
+    { "type": "thinking_level_change", "id": "316b1e52", "parentId": "6a84b517", "timestamp": "2026-11-10T16:54:54.154Z", "thinkingLevel": "high" },
+    { "type": "model_change", "id": "1e140387", "parentId": "316b1e52", "timestamp": "2026-11-10T16:55:04.655Z", "provider": "pi-claude-cli", "modelId": "claude-fable-5-2" }
+  ],
+  "extensionEntryIds": ["d1cbb857", "a5e70b3a"]
 }

@@ -7,6 +7,13 @@ the background and posts the child's last assistant message back as a new turn.
 Tools: `subagent`, `subagent_message`, `subagent_wait`, `subagent_list`. Child sessions live under
 `~/.pi/agent/subagents/<parent-session-id>/`.
 
+- `subagent` with `fork: true` starts the child from a copy of the parent's active branch; the task is its
+  next message.
+- `subagent_message` reaches a running child as a steering message, over a Unix socket in the temp
+  directory (`PI_SUBAGENT_SOCKET`).
+- A result counts as delivered once it is in the parent's transcript. One that Escape or quitting pi
+  dropped from the queue is added back without starting a turn.
+
 Requires pi started in a Rex terminal (`REX_SESSION` set) with `rex` on `PATH`; `subagent` fails
 outside Rex.
 
